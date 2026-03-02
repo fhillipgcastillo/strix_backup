@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "strix-agent"
-version = "0.5.0"
+version = "0.8.2"
 description = "Open-source AI Hackers for your apps"
 authors = ["Strix <hi@usestrix.com>"]
 readme = "README.md"
@@ -35,7 +35,8 @@ packages = [
 include = [
   "LICENSE",
   "README.md",
-  "strix/**/*.jinja",
+  "strix/agents/**/*.jinja",
+  "strix/skills/**/*.md",
   "strix/**/*.xml",
   "strix/**/*.tcss"
 ]
@@ -46,7 +47,7 @@ strix = "strix.interface.main:main"
 [tool.poetry.dependencies]
 python = "^3.12"
 # Core CLI dependencies
-litellm = { version = "~1.80.7", extras = ["proxy"] }
+litellm = { version = "~1.81.1", extras = ["proxy"] }
 tenacity = "^9.0.0"
 pydantic = {extras = ["email"], version = "^2.11.3"}
 rich = "*"
@@ -54,6 +55,7 @@ docker = "^7.1.0"
 textual = "^4.0.0"
 xmltodict = "^0.13.0"
 requests = "^2.32.0"
+cvss = "^3.2"
 
 # Optional LLM provider dependencies
 google-cloud-aiplatform = { version = ">=1.38", optional = true }
@@ -68,6 +70,7 @@ gql = { version = "^3.5.3", extras = ["requests"], optional = true }
 pyte = { version = "^0.8.1", optional = true }
 libtmux = { version = "^0.46.2", optional = true }
 numpydoc = { version = "^1.8.0", optional = true }
+defusedxml = "^0.7.1"
 
 [tool.poetry.extras]
 vertex = ["google-cloud-aiplatform"]
@@ -144,6 +147,7 @@ module = [
     "pyte.*",
     "libtmux.*",
     "pytest.*",
+    "cvss.*",
 ]
 ignore_missing_imports = true
 

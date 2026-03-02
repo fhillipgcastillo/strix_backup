@@ -6,7 +6,6 @@ Strix Agent Interface
 import argparse
 import asyncio
 import logging
-import os
 import shutil
 import sys
 from pathlib import Path
@@ -18,9 +17,16 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from strix.interface.cli import run_cli
-from strix.interface.tui import run_tui
-from strix.interface.utils import (
+from strix.config import Config, apply_saved_config, save_current_config
+from strix.config.config import resolve_llm_config
+from strix.llm.utils import resolve_strix_model
+
+
+apply_saved_config()
+
+from strix.interface.cli import run_cli  # noqa: E402
+from strix.interface.tui import run_tui  # noqa: E402
+from strix.interface.utils import (  # noqa: E402
     assign_workspace_subdirs,
     build_final_stats_text,
     check_docker_connection,
@@ -30,10 +36,13 @@ from strix.interface.utils import (
     image_exists,
     infer_target_type,
     process_pull_line,
+    rewrite_localhost_targets,
+    validate_config_file,
     validate_llm_response,
 )
-from strix.runtime.docker_runtime import STRIX_IMAGE
-from strix.telemetry.tracer import get_global_tracer
+from strix.runtime.docker_runtime import HOST_GATEWAY_HOSTNAME  # noqa: E402
+from strix.telemetry import posthog  # noqa: E402
+from strix.telemetry.tracer import get_global_tracer  # noqa: E402
 
 
 logging.getLogger().setLevel(logging.ERROR)
@@ -44,30 +53,35 @@ def validate_environment() -> None:  # noqa: PLR0912, PLR0915
     missing_required_vars = []
     missing_optional_vars = []
 
-    if not os.getenv("STRIX_LLM"):
+    strix_llm = Config.get("strix_llm")
+    uses_strix_models = strix_llm and strix_llm.startswith("strix/")
+
+    if not strix_llm:
         missing_required_vars.append("STRIX_LLM")
 
-    has_base_url = any(
+    has_base_url = uses_strix_models or any(
         [
-            os.getenv("LLM_API_BASE"),
-            os.getenv("OPENAI_API_BASE"),
-            os.getenv("LITELLM_BASE_URL"),
-            os.getenv("OLLAMA_API_BASE"),
+            Config.get("llm_api_base"),
+            Config.get("openai_api_base"),
+            Config.get("litellm_base_url"),
+            Config.get("ollama_api_base"),
         ]
     )
 
-    if not os.getenv("LLM_API_KEY"):
+    if not Config.get("llm_api_key"):
         missing_optional_vars.append("LLM_API_KEY")
 
     if not has_base_url:
         missing_optional_vars.append("LLM_API_BASE")
 
-    if not os.getenv("PERPLEXITY_API_KEY"):
+    if not Config.get("perplexity_api_key"):
         missing_optional_vars.append("PERPLEXITY_API_KEY")
+
+    if not Config.get("strix_reasoning_effort"):
+        missing_optional_vars.append("STRIX_REASONING_EFFORT")
 
     if missing_required_vars:
         error_text = Text()
-        error_text.append("❌ ", style="bold red")
         error_text.append("MISSING REQUIRED ENVIRONMENT VARIABLES", style="bold red")
         error_text.append("\n\n", style="white")
 
@@ -116,9 +130,20 @@ def validate_environment() -> None:  # noqa: PLR0912, PLR0915
                         " - API key for Perplexity AI web search (enables real-time research)\n",
                         style="white",
                     )
+                elif var == "STRIX_REASONING_EFFORT":
+                    error_text.append("• ", style="white")
+                    error_text.append("STRIX_REASONING_EFFORT", style="bold cyan")
+                    error_text.append(
+                        " - Reasoning effort level: none, minimal, low, medium, high, xhigh "
+                        "(default: high)\n",
+                        style="white",
+                    )
 
         error_text.append("\nExample setup:\n", style="white")
-        error_text.append("export STRIX_LLM='openai/gpt-5'\n", style="dim white")
+        if uses_strix_models:
+            error_text.append("export STRIX_LLM='strix/gpt-5'\n", style="dim white")
+        else:
+            error_text.append("export STRIX_LLM='openai/gpt-5'\n", style="dim white")
 
         if missing_optional_vars:
             for var in missing_optional_vars:
@@ -138,11 +163,16 @@ def validate_environment() -> None:  # noqa: PLR0912, PLR0915
                     error_text.append(
                         "export PERPLEXITY_API_KEY='your-perplexity-key-here'\n", style="dim white"
                     )
+                elif var == "STRIX_REASONING_EFFORT":
+                    error_text.append(
+                        "export STRIX_REASONING_EFFORT='high'\n",
+                        style="dim white",
+                    )
 
         panel = Panel(
             error_text,
-            title="[bold red]🛡️  STRIX CONFIGURATION ERROR",
-            title_align="center",
+            title="[bold white]STRIX",
+            title_align="left",
             border_style="red",
             padding=(1, 2),
         )
@@ -157,7 +187,6 @@ def check_docker_installed() -> None:
     if shutil.which("docker") is None:
         console = Console()
         error_text = Text()
-        error_text.append("❌ ", style="bold red")
         error_text.append("DOCKER NOT INSTALLED", style="bold red")
         error_text.append("\n\n", style="white")
         error_text.append("The 'docker' CLI was not found in your PATH.\n", style="white")
@@ -167,8 +196,8 @@ def check_docker_installed() -> None:
 
         panel = Panel(
             error_text,
-            title="[bold red]🛡️  STRIX STARTUP ERROR",
-            title_align="center",
+            title="[bold white]STRIX",
+            title_align="left",
             border_style="red",
             padding=(1, 2),
         )
@@ -180,24 +209,19 @@ async def warm_up_llm() -> None:
     console = Console()
 
     try:
-        model_name = os.getenv("STRIX_LLM", "openai/gpt-5")
-        api_key = os.getenv("LLM_API_KEY")
-        api_base = (
-            os.getenv("LLM_API_BASE")
-            or os.getenv("OPENAI_API_BASE")
-            or os.getenv("LITELLM_BASE_URL")
-            or os.getenv("OLLAMA_API_BASE")
-        )
+        model_name, api_key, api_base = resolve_llm_config()
+        litellm_model, _ = resolve_strix_model(model_name)
+        litellm_model = litellm_model or model_name
 
         test_messages = [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "Reply with just 'OK'."},
         ]
 
-        llm_timeout = int(os.getenv("LLM_TIMEOUT", "600"))
+        llm_timeout = int(Config.get("llm_timeout") or "300")
 
         completion_kwargs: dict[str, Any] = {
-            "model": model_name,
+            "model": litellm_model,
             "messages": test_messages,
             "timeout": llm_timeout,
         }
@@ -212,7 +236,6 @@ async def warm_up_llm() -> None:
 
     except Exception as e:  # noqa: BLE001
         error_text = Text()
-        error_text.append("❌ ", style="bold red")
         error_text.append("LLM CONNECTION FAILED", style="bold red")
         error_text.append("\n\n", style="white")
         error_text.append("Could not establish connection to the language model.\n", style="white")
@@ -221,8 +244,8 @@ async def warm_up_llm() -> None:
 
         panel = Panel(
             error_text,
-            title="[bold red]🛡️  STRIX STARTUP ERROR",
-            title_align="center",
+            title="[bold white]STRIX",
+            title_align="left",
             border_style="red",
             padding=(1, 2),
         )
@@ -313,12 +336,6 @@ Examples:
     )
 
     parser.add_argument(
-        "--run-name",
-        type=str,
-        help="Custom name for this penetration test run",
-    )
-
-    parser.add_argument(
         "-n",
         "--non-interactive",
         action="store_true",
@@ -341,6 +358,12 @@ Examples:
             "'deep' for thorough security reviews (default). "
             "Default: deep."
         ),
+    )
+
+    parser.add_argument(
+        "--config",
+        type=str,
+        help="Path to a custom config file (JSON) to use instead of ~/.strix/cli-config.json",
     )
 
     args = parser.parse_args()
@@ -377,6 +400,7 @@ Examples:
             parser.error(f"Invalid target '{target}'")
 
     assign_workspace_subdirs(args.targets_info)
+    rewrite_localhost_targets(args.targets_info, HOST_GATEWAY_HOSTNAME)
 
     return args
 
@@ -393,30 +417,22 @@ def display_completion_message(args: argparse.Namespace, results_path: Path) -> 
 
     completion_text = Text()
     if scan_completed:
-        completion_text.append("🦉 ", style="bold white")
-        completion_text.append("AGENT FINISHED", style="bold green")
-        completion_text.append(" • ", style="dim white")
-        completion_text.append("Penetration test completed", style="white")
+        completion_text.append("Penetration test completed", style="bold #22c55e")
     else:
-        completion_text.append("🦉 ", style="bold white")
-        completion_text.append("SESSION ENDED", style="bold yellow")
-        completion_text.append(" • ", style="dim white")
-        completion_text.append("Penetration test interrupted by user", style="white")
-
-    stats_text = build_final_stats_text(tracer)
+        completion_text.append("SESSION ENDED", style="bold #eab308")
 
     target_text = Text()
+    target_text.append("Target", style="dim")
+    target_text.append("  ")
     if len(args.targets_info) == 1:
-        target_text.append("🎯 Target: ", style="bold cyan")
         target_text.append(args.targets_info[0]["original"], style="bold white")
     else:
-        target_text.append("🎯 Targets: ", style="bold cyan")
-        target_text.append(f"{len(args.targets_info)} targets\n", style="bold white")
-        for i, target_info in enumerate(args.targets_info):
-            target_text.append("   • ", style="dim white")
+        target_text.append(f"{len(args.targets_info)} targets", style="bold white")
+        for target_info in args.targets_info:
+            target_text.append("\n        ")
             target_text.append(target_info["original"], style="white")
-            if i < len(args.targets_info) - 1:
-                target_text.append("\n")
+
+    stats_text = build_final_stats_text(tracer)
 
     panel_parts = [completion_text, "\n\n", target_text]
 
@@ -425,18 +441,20 @@ def display_completion_message(args: argparse.Namespace, results_path: Path) -> 
 
     if scan_completed or has_vulnerabilities:
         results_text = Text()
-        results_text.append("📊 Results Saved To: ", style="bold cyan")
-        results_text.append(str(results_path), style="bold yellow")
-        panel_parts.extend(["\n\n", results_text])
+        results_text.append("\n")
+        results_text.append("Output", style="dim")
+        results_text.append("  ")
+        results_text.append(str(results_path), style="#60a5fa")
+        panel_parts.extend(["\n", results_text])
 
     panel_content = Text.assemble(*panel_parts)
 
-    border_style = "green" if scan_completed else "yellow"
+    border_style = "#22c55e" if scan_completed else "#eab308"
 
     panel = Panel(
         panel_content,
-        title="[bold green]🛡️  STRIX CYBERSECURITY AGENT",
-        title_align="center",
+        title="[bold white]STRIX",
+        title_align="left",
         border_style=border_style,
         padding=(1, 2),
     )
@@ -444,8 +462,7 @@ def display_completion_message(args: argparse.Namespace, results_path: Path) -> 
     console.print("\n")
     console.print(panel)
     console.print()
-    console.print("[dim]🌐 Website:[/] [cyan]https://usestrix.com[/]")
-    console.print("[dim]💬 Discord:[/] [cyan]https://discord.gg/YjKFvEZSdZ[/]")
+    console.print("[#60a5fa]models.strix.ai[/]  [dim]·[/]  [#60a5fa]discord.gg/strix-ai[/]")
     console.print()
 
 
@@ -453,11 +470,11 @@ def pull_docker_image() -> None:
     console = Console()
     client = check_docker_connection()
 
-    if image_exists(client, STRIX_IMAGE):
+    if image_exists(client, Config.get("strix_image")):  # type: ignore[arg-type]
         return
 
     console.print()
-    console.print(f"[bold cyan]🐳 Pulling Docker image:[/] {STRIX_IMAGE}")
+    console.print(f"[dim]Pulling image[/] {Config.get('strix_image')}")
     console.print("[dim yellow]This only happens on first run and may take a few minutes...[/]")
     console.print()
 
@@ -466,22 +483,21 @@ def pull_docker_image() -> None:
             layers_info: dict[str, str] = {}
             last_update = ""
 
-            for line in client.api.pull(STRIX_IMAGE, stream=True, decode=True):
+            for line in client.api.pull(Config.get("strix_image"), stream=True, decode=True):
                 last_update = process_pull_line(line, layers_info, status, last_update)
 
         except DockerException as e:
             console.print()
             error_text = Text()
-            error_text.append("❌ ", style="bold red")
             error_text.append("FAILED TO PULL IMAGE", style="bold red")
             error_text.append("\n\n", style="white")
-            error_text.append(f"Could not download: {STRIX_IMAGE}\n", style="white")
+            error_text.append(f"Could not download: {Config.get('strix_image')}\n", style="white")
             error_text.append(str(e), style="dim red")
 
             panel = Panel(
                 error_text,
-                title="[bold red]🛡️  DOCKER PULL ERROR",
-                title_align="center",
+                title="[bold white]STRIX",
+                title_align="left",
                 border_style="red",
                 padding=(1, 2),
             )
@@ -489,10 +505,19 @@ def pull_docker_image() -> None:
             sys.exit(1)
 
     success_text = Text()
-    success_text.append("✅ ", style="bold green")
-    success_text.append("Successfully pulled Docker image", style="green")
+    success_text.append("Docker image ready", style="#22c55e")
     console.print(success_text)
     console.print()
+
+
+def apply_config_override(config_path: str) -> None:
+    Config._config_file_override = validate_config_file(config_path)
+    apply_saved_config(force=True)
+
+
+def persist_config() -> None:
+    if Config._config_file_override is None:
+        save_current_config()
 
 
 def main() -> None:
@@ -501,14 +526,18 @@ def main() -> None:
 
     args = parse_arguments()
 
+    if args.config:
+        apply_config_override(args.config)
+
     check_docker_installed()
     pull_docker_image()
 
     validate_environment()
     asyncio.run(warm_up_llm())
 
-    if not args.run_name:
-        args.run_name = generate_run_name(args.targets_info)
+    persist_config()
+
+    args.run_name = generate_run_name(args.targets_info)
 
     for target_info in args.targets_info:
         if target_info["type"] == "repository":
@@ -519,10 +548,32 @@ def main() -> None:
 
     args.local_sources = collect_local_sources(args.targets_info)
 
-    if args.non_interactive:
-        asyncio.run(run_cli(args))
-    else:
-        asyncio.run(run_tui(args))
+    is_whitebox = bool(args.local_sources)
+
+    posthog.start(
+        model=Config.get("strix_llm"),
+        scan_mode=args.scan_mode,
+        is_whitebox=is_whitebox,
+        interactive=not args.non_interactive,
+        has_instructions=bool(args.instruction),
+    )
+
+    exit_reason = "user_exit"
+    try:
+        if args.non_interactive:
+            asyncio.run(run_cli(args))
+        else:
+            asyncio.run(run_tui(args))
+    except KeyboardInterrupt:
+        exit_reason = "interrupted"
+    except Exception as e:
+        exit_reason = "error"
+        posthog.error("unhandled_exception", str(e))
+        raise
+    finally:
+        tracer = get_global_tracer()
+        if tracer:
+            posthog.end(tracer, exit_reason=exit_reason)
 
     results_path = Path("strix_runs") / args.run_name
     display_completion_message(args, results_path)

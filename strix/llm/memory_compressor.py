@@ -1,8 +1,9 @@
 import logging
-import os
 from typing import Any
 
 import litellm
+
+from strix.config.config import Config, resolve_llm_config
 
 
 logger = logging.getLogger(__name__)
@@ -85,12 +86,12 @@ def _extract_message_text(msg: dict[str, Any]) -> str:
 def _summarize_messages(
     messages: list[dict[str, Any]],
     model: str,
-    timeout: int = 600,
+    timeout: int = 30,
 ) -> dict[str, Any]:
     if not messages:
         empty_summary = "<context_summary message_count='0'>{text}</context_summary>"
         return {
-            "role": "assistant",
+            "role": "user",
             "content": empty_summary.format(text="No messages to summarize"),
         }
 
@@ -103,12 +104,18 @@ def _summarize_messages(
     conversation = "\n".join(formatted)
     prompt = SUMMARY_PROMPT_TEMPLATE.format(conversation=conversation)
 
+    _, api_key, api_base = resolve_llm_config()
+
     try:
-        completion_args = {
+        completion_args: dict[str, Any] = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "timeout": timeout,
         }
+        if api_key:
+            completion_args["api_key"] = api_key
+        if api_base:
+            completion_args["api_base"] = api_base
 
         response = litellm.completion(**completion_args)
         summary = response.choices[0].message.content or ""
@@ -116,7 +123,7 @@ def _summarize_messages(
             return messages[0]
         summary_msg = "<context_summary message_count='{count}'>{text}</context_summary>"
         return {
-            "role": "assistant",
+            "role": "user",
             "content": summary_msg.format(count=len(messages), text=summary),
         }
     except Exception:
@@ -147,11 +154,11 @@ class MemoryCompressor:
         self,
         max_images: int = 3,
         model_name: str | None = None,
-        timeout: int = 600,
+        timeout: int | None = None,
     ):
         self.max_images = max_images
-        self.model_name = model_name or os.getenv("STRIX_LLM", "openai/gpt-5")
-        self.timeout = timeout
+        self.model_name = model_name or Config.get("strix_llm")
+        self.timeout = timeout or int(Config.get("strix_memory_compressor_timeout") or "120")
 
         if not self.model_name:
             raise ValueError("STRIX_LLM environment variable must be set and not empty")

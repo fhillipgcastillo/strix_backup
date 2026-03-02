@@ -4,6 +4,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import uuid4
 
+from strix.telemetry import posthog
+
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -33,6 +35,8 @@ class Tracer:
         self.agents: dict[str, dict[str, Any]] = {}
         self.tool_executions: dict[int, dict[str, Any]] = {}
         self.chat_messages: list[dict[str, Any]] = []
+        self.streaming_content: dict[str, str] = {}
+        self.interrupted_content: dict[str, str] = {}
 
         self.vulnerability_reports: list[dict[str, Any]] = []
         self.final_scan_result: str | None = None
@@ -52,7 +56,8 @@ class Tracer:
         self._next_message_id = 1
         self._saved_vuln_ids: set[str] = set()
 
-        self.vulnerability_found_callback: Callable[[str, str, str, str], None] | None = None
+        self.caido_url: str | None = None
+        self.vulnerability_found_callback: Callable[[dict[str, Any]], None] | None = None
 
     def set_run_name(self, run_name: str) -> None:
         self.run_name = run_name
@@ -69,48 +74,112 @@ class Tracer:
 
         return self._run_dir
 
-    def add_vulnerability_report(
+    def add_vulnerability_report(  # noqa: PLR0912
         self,
         title: str,
-        content: str,
         severity: str,
+        description: str | None = None,
+        impact: str | None = None,
+        target: str | None = None,
+        technical_analysis: str | None = None,
+        poc_description: str | None = None,
+        poc_script_code: str | None = None,
+        remediation_steps: str | None = None,
+        cvss: float | None = None,
+        cvss_breakdown: dict[str, str] | None = None,
+        endpoint: str | None = None,
+        method: str | None = None,
+        cve: str | None = None,
+        cwe: str | None = None,
+        code_locations: list[dict[str, Any]] | None = None,
     ) -> str:
         report_id = f"vuln-{len(self.vulnerability_reports) + 1:04d}"
 
-        report = {
+        report: dict[str, Any] = {
             "id": report_id,
             "title": title.strip(),
-            "content": content.strip(),
             "severity": severity.lower().strip(),
             "timestamp": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC"),
         }
 
+        if description:
+            report["description"] = description.strip()
+        if impact:
+            report["impact"] = impact.strip()
+        if target:
+            report["target"] = target.strip()
+        if technical_analysis:
+            report["technical_analysis"] = technical_analysis.strip()
+        if poc_description:
+            report["poc_description"] = poc_description.strip()
+        if poc_script_code:
+            report["poc_script_code"] = poc_script_code.strip()
+        if remediation_steps:
+            report["remediation_steps"] = remediation_steps.strip()
+        if cvss is not None:
+            report["cvss"] = cvss
+        if cvss_breakdown:
+            report["cvss_breakdown"] = cvss_breakdown
+        if endpoint:
+            report["endpoint"] = endpoint.strip()
+        if method:
+            report["method"] = method.strip()
+        if cve:
+            report["cve"] = cve.strip()
+        if cwe:
+            report["cwe"] = cwe.strip()
+        if code_locations:
+            report["code_locations"] = code_locations
+
         self.vulnerability_reports.append(report)
         logger.info(f"Added vulnerability report: {report_id} - {title}")
+        posthog.finding(severity)
 
         if self.vulnerability_found_callback:
-            self.vulnerability_found_callback(
-                report_id, title.strip(), content.strip(), severity.lower().strip()
-            )
+            self.vulnerability_found_callback(report)
 
         self.save_run_data()
         return report_id
 
-    def set_final_scan_result(
-        self,
-        content: str,
-        success: bool = True,
-    ) -> None:
-        self.final_scan_result = content.strip()
+    def get_existing_vulnerabilities(self) -> list[dict[str, Any]]:
+        return list(self.vulnerability_reports)
 
+    def update_scan_final_fields(
+        self,
+        executive_summary: str,
+        methodology: str,
+        technical_analysis: str,
+        recommendations: str,
+    ) -> None:
         self.scan_results = {
             "scan_completed": True,
-            "content": content,
-            "success": success,
+            "executive_summary": executive_summary.strip(),
+            "methodology": methodology.strip(),
+            "technical_analysis": technical_analysis.strip(),
+            "recommendations": recommendations.strip(),
+            "success": True,
         }
 
-        logger.info(f"Set final scan result: success={success}")
+        self.final_scan_result = f"""# Executive Summary
+
+{executive_summary.strip()}
+
+# Methodology
+
+{methodology.strip()}
+
+# Technical Analysis
+
+{technical_analysis.strip()}
+
+# Recommendations
+
+{recommendations.strip()}
+"""
+
+        logger.info("Updated scan final fields")
         self.save_run_data(mark_complete=True)
+        posthog.end(self, exit_reason="finished_by_tool")
 
     def log_agent_creation(
         self, agent_id: str, name: str, task: str, parent_id: str | None = None
@@ -202,7 +271,7 @@ class Tracer:
         )
         self.get_run_dir()
 
-    def save_run_data(self, mark_complete: bool = False) -> None:
+    def save_run_data(self, mark_complete: bool = False) -> None:  # noqa: PLR0912, PLR0915
         try:
             run_dir = self.get_run_dir()
             if mark_complete:
@@ -230,42 +299,108 @@ class Tracer:
                     if report["id"] not in self._saved_vuln_ids
                 ]
 
+                severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+                sorted_reports = sorted(
+                    self.vulnerability_reports,
+                    key=lambda x: (severity_order.get(x["severity"], 5), x["timestamp"]),
+                )
+
                 for report in new_reports:
                     vuln_file = vuln_dir / f"{report['id']}.md"
                     with vuln_file.open("w", encoding="utf-8") as f:
-                        f.write(f"# {report['title']}\n\n")
-                        f.write(f"**ID:** {report['id']}\n")
-                        f.write(f"**Severity:** {report['severity'].upper()}\n")
-                        f.write(f"**Found:** {report['timestamp']}\n\n")
-                        f.write("## Description\n\n")
-                        f.write(f"{report['content']}\n")
+                        f.write(f"# {report.get('title', 'Untitled Vulnerability')}\n\n")
+                        f.write(f"**ID:** {report.get('id', 'unknown')}\n")
+                        f.write(f"**Severity:** {report.get('severity', 'unknown').upper()}\n")
+                        f.write(f"**Found:** {report.get('timestamp', 'unknown')}\n")
+
+                        metadata_fields: list[tuple[str, Any]] = [
+                            ("Target", report.get("target")),
+                            ("Endpoint", report.get("endpoint")),
+                            ("Method", report.get("method")),
+                            ("CVE", report.get("cve")),
+                            ("CWE", report.get("cwe")),
+                        ]
+                        cvss_score = report.get("cvss")
+                        if cvss_score is not None:
+                            metadata_fields.append(("CVSS", cvss_score))
+
+                        for label, value in metadata_fields:
+                            if value:
+                                f.write(f"**{label}:** {value}\n")
+
+                        f.write("\n## Description\n\n")
+                        desc = report.get("description") or "No description provided."
+                        f.write(f"{desc}\n\n")
+
+                        if report.get("impact"):
+                            f.write("## Impact\n\n")
+                            f.write(f"{report['impact']}\n\n")
+
+                        if report.get("technical_analysis"):
+                            f.write("## Technical Analysis\n\n")
+                            f.write(f"{report['technical_analysis']}\n\n")
+
+                        if report.get("poc_description") or report.get("poc_script_code"):
+                            f.write("## Proof of Concept\n\n")
+                            if report.get("poc_description"):
+                                f.write(f"{report['poc_description']}\n\n")
+                            if report.get("poc_script_code"):
+                                f.write("```\n")
+                                f.write(f"{report['poc_script_code']}\n")
+                                f.write("```\n\n")
+
+                        if report.get("code_locations"):
+                            f.write("## Code Analysis\n\n")
+                            for i, loc in enumerate(report["code_locations"]):
+                                prefix = f"**Location {i + 1}:**"
+                                file_ref = loc.get("file", "unknown")
+                                line_ref = ""
+                                if loc.get("start_line") is not None:
+                                    if loc.get("end_line") and loc["end_line"] != loc["start_line"]:
+                                        line_ref = f" (lines {loc['start_line']}-{loc['end_line']})"
+                                    else:
+                                        line_ref = f" (line {loc['start_line']})"
+                                f.write(f"{prefix} `{file_ref}`{line_ref}\n")
+                                if loc.get("label"):
+                                    f.write(f"  {loc['label']}\n")
+                                if loc.get("snippet"):
+                                    f.write(f"  ```\n  {loc['snippet']}\n  ```\n")
+                                if loc.get("fix_before") or loc.get("fix_after"):
+                                    f.write("\n  **Suggested Fix:**\n")
+                                    f.write("```diff\n")
+                                    if loc.get("fix_before"):
+                                        for line in loc["fix_before"].splitlines():
+                                            f.write(f"- {line}\n")
+                                    if loc.get("fix_after"):
+                                        for line in loc["fix_after"].splitlines():
+                                            f.write(f"+ {line}\n")
+                                    f.write("```\n")
+                                f.write("\n")
+
+                        if report.get("remediation_steps"):
+                            f.write("## Remediation\n\n")
+                            f.write(f"{report['remediation_steps']}\n\n")
+
                     self._saved_vuln_ids.add(report["id"])
 
-                if self.vulnerability_reports:
-                    severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-                    sorted_reports = sorted(
-                        self.vulnerability_reports,
-                        key=lambda x: (severity_order.get(x["severity"], 5), x["timestamp"]),
-                    )
+                vuln_csv_file = run_dir / "vulnerabilities.csv"
+                with vuln_csv_file.open("w", encoding="utf-8", newline="") as f:
+                    import csv
 
-                    vuln_csv_file = run_dir / "vulnerabilities.csv"
-                    with vuln_csv_file.open("w", encoding="utf-8", newline="") as f:
-                        import csv
+                    fieldnames = ["id", "title", "severity", "timestamp", "file"]
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
 
-                        fieldnames = ["id", "title", "severity", "timestamp", "file"]
-                        writer = csv.DictWriter(f, fieldnames=fieldnames)
-                        writer.writeheader()
-
-                        for report in sorted_reports:
-                            writer.writerow(
-                                {
-                                    "id": report["id"],
-                                    "title": report["title"],
-                                    "severity": report["severity"].upper(),
-                                    "timestamp": report["timestamp"],
-                                    "file": f"vulnerabilities/{report['id']}.md",
-                                }
-                            )
+                    for report in sorted_reports:
+                        writer.writerow(
+                            {
+                                "id": report["id"],
+                                "title": report["title"],
+                                "severity": report["severity"].upper(),
+                                "timestamp": report["timestamp"],
+                                "file": f"vulnerabilities/{report['id']}.md",
+                            }
+                        )
 
                 if new_reports:
                     logger.info(
@@ -291,14 +426,14 @@ class Tracer:
     def get_agent_tools(self, agent_id: str) -> list[dict[str, Any]]:
         return [
             exec_data
-            for exec_data in self.tool_executions.values()
+            for exec_data in list(self.tool_executions.values())
             if exec_data.get("agent_id") == agent_id
         ]
 
     def get_real_tool_count(self) -> int:
         return sum(
             1
-            for exec_data in self.tool_executions.values()
+            for exec_data in list(self.tool_executions.values())
             if exec_data.get("tool_name") not in ["scan_start_info", "subagent_start_info"]
         )
 
@@ -309,10 +444,8 @@ class Tracer:
             "input_tokens": 0,
             "output_tokens": 0,
             "cached_tokens": 0,
-            "cache_creation_tokens": 0,
             "cost": 0.0,
             "requests": 0,
-            "failed_requests": 0,
         }
 
         for agent_instance in _agent_instances.values():
@@ -321,10 +454,8 @@ class Tracer:
                 total_stats["input_tokens"] += agent_stats.input_tokens
                 total_stats["output_tokens"] += agent_stats.output_tokens
                 total_stats["cached_tokens"] += agent_stats.cached_tokens
-                total_stats["cache_creation_tokens"] += agent_stats.cache_creation_tokens
                 total_stats["cost"] += agent_stats.cost
                 total_stats["requests"] += agent_stats.requests
-                total_stats["failed_requests"] += agent_stats.failed_requests
 
         total_stats["cost"] = round(total_stats["cost"], 4)
 
@@ -332,6 +463,29 @@ class Tracer:
             "total": total_stats,
             "total_tokens": total_stats["input_tokens"] + total_stats["output_tokens"],
         }
+
+    def update_streaming_content(self, agent_id: str, content: str) -> None:
+        self.streaming_content[agent_id] = content
+
+    def clear_streaming_content(self, agent_id: str) -> None:
+        self.streaming_content.pop(agent_id, None)
+
+    def get_streaming_content(self, agent_id: str) -> str | None:
+        return self.streaming_content.get(agent_id)
+
+    def finalize_streaming_as_interrupted(self, agent_id: str) -> str | None:
+        content = self.streaming_content.pop(agent_id, None)
+        if content and content.strip():
+            self.interrupted_content[agent_id] = content
+            self.log_chat_message(
+                content=content,
+                role="assistant",
+                agent_id=agent_id,
+                metadata={"interrupted": True},
+            )
+            return content
+
+        return self.interrupted_content.pop(agent_id, None)
 
     def cleanup(self) -> None:
         self.save_run_data(mark_complete=True)

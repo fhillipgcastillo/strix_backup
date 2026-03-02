@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import logging
 import os
 import signal
 import sys
-from multiprocessing import Process, Queue
 from typing import Any
 
 import uvicorn
@@ -23,17 +21,22 @@ parser = argparse.ArgumentParser(description="Start Strix tool server")
 parser.add_argument("--token", required=True, help="Authentication token")
 parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")  # nosec
 parser.add_argument("--port", type=int, required=True, help="Port to bind to")
+parser.add_argument(
+    "--timeout",
+    type=int,
+    default=120,
+    help="Hard timeout in seconds for each request execution (default: 120)",
+)
 
 args = parser.parse_args()
 EXPECTED_TOKEN = args.token
+REQUEST_TIMEOUT = args.timeout
 
 app = FastAPI()
 security = HTTPBearer()
-
 security_dependency = Depends(security)
 
-agent_processes: dict[str, dict[str, Any]] = {}
-agent_queues: dict[str, dict[str, Queue[Any]]] = {}
+agent_tasks: dict[str, asyncio.Task[Any]] = {}
 
 
 def verify_token(credentials: HTTPAuthorizationCredentials) -> str:
@@ -65,60 +68,19 @@ class ToolExecutionResponse(BaseModel):
     error: str | None = None
 
 
-def agent_worker(_agent_id: str, request_queue: Queue[Any], response_queue: Queue[Any]) -> None:
-    null_handler = logging.NullHandler()
-
-    root_logger = logging.getLogger()
-    root_logger.handlers = [null_handler]
-    root_logger.setLevel(logging.CRITICAL)
-
-    from strix.tools.argument_parser import ArgumentConversionError, convert_arguments
+async def _run_tool(agent_id: str, tool_name: str, kwargs: dict[str, Any]) -> Any:
+    from strix.tools.argument_parser import convert_arguments
+    from strix.tools.context import set_current_agent_id
     from strix.tools.registry import get_tool_by_name
 
-    while True:
-        try:
-            request = request_queue.get()
+    set_current_agent_id(agent_id)
 
-            if request is None:
-                break
+    tool_func = get_tool_by_name(tool_name)
+    if not tool_func:
+        raise ValueError(f"Tool '{tool_name}' not found")
 
-            tool_name = request["tool_name"]
-            kwargs = request["kwargs"]
-
-            try:
-                tool_func = get_tool_by_name(tool_name)
-                if not tool_func:
-                    response_queue.put({"error": f"Tool '{tool_name}' not found"})
-                    continue
-
-                converted_kwargs = convert_arguments(tool_func, kwargs)
-                result = tool_func(**converted_kwargs)
-
-                response_queue.put({"result": result})
-
-            except (ArgumentConversionError, ValidationError) as e:
-                response_queue.put({"error": f"Invalid arguments: {e}"})
-            except (RuntimeError, ValueError, ImportError) as e:
-                response_queue.put({"error": f"Tool execution error: {e}"})
-
-        except (RuntimeError, ValueError, ImportError) as e:
-            response_queue.put({"error": f"Worker error: {e}"})
-
-
-def ensure_agent_process(agent_id: str) -> tuple[Queue[Any], Queue[Any]]:
-    if agent_id not in agent_processes:
-        request_queue: Queue[Any] = Queue()
-        response_queue: Queue[Any] = Queue()
-
-        process = Process(
-            target=agent_worker, args=(agent_id, request_queue, response_queue), daemon=True
-        )
-        process.start()
-
-        agent_processes[agent_id] = {"process": process, "pid": process.pid}
-        agent_queues[agent_id] = {"request": request_queue, "response": response_queue}
-
-    return agent_queues[agent_id]["request"], agent_queues[agent_id]["response"]
+    converted_kwargs = convert_arguments(tool_func, kwargs)
+    return await asyncio.to_thread(tool_func, **converted_kwargs)
 
 
 @app.post("/execute", response_model=ToolExecutionResponse)
@@ -127,20 +89,42 @@ async def execute_tool(
 ) -> ToolExecutionResponse:
     verify_token(credentials)
 
-    request_queue, response_queue = ensure_agent_process(request.agent_id)
+    agent_id = request.agent_id
 
-    request_queue.put({"tool_name": request.tool_name, "kwargs": request.kwargs})
+    if agent_id in agent_tasks:
+        old_task = agent_tasks[agent_id]
+        if not old_task.done():
+            old_task.cancel()
+
+    task = asyncio.create_task(
+        asyncio.wait_for(
+            _run_tool(agent_id, request.tool_name, request.kwargs), timeout=REQUEST_TIMEOUT
+        )
+    )
+    agent_tasks[agent_id] = task
 
     try:
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(None, response_queue.get)
+        result = await task
+        return ToolExecutionResponse(result=result)
 
-        if "error" in response:
-            return ToolExecutionResponse(error=response["error"])
-        return ToolExecutionResponse(result=response.get("result"))
+    except asyncio.CancelledError:
+        return ToolExecutionResponse(error="Cancelled by newer request")
 
-    except (RuntimeError, ValueError, OSError) as e:
-        return ToolExecutionResponse(error=f"Worker error: {e}")
+    except TimeoutError:
+        return ToolExecutionResponse(error=f"Tool timed out after {REQUEST_TIMEOUT}s")
+
+    except ValidationError as e:
+        return ToolExecutionResponse(error=f"Invalid arguments: {e}")
+
+    except (ValueError, RuntimeError, ImportError) as e:
+        return ToolExecutionResponse(error=f"Tool execution error: {e}")
+
+    except Exception as e:  # noqa: BLE001
+        return ToolExecutionResponse(error=f"Unexpected error: {e}")
+
+    finally:
+        if agent_tasks.get(agent_id) is task:
+            del agent_tasks[agent_id]
 
 
 @app.post("/register_agent")
@@ -148,8 +132,6 @@ async def register_agent(
     agent_id: str, credentials: HTTPAuthorizationCredentials = security_dependency
 ) -> dict[str, str]:
     verify_token(credentials)
-
-    ensure_agent_process(agent_id)
     return {"status": "registered", "agent_id": agent_id}
 
 
@@ -160,35 +142,16 @@ async def health_check() -> dict[str, Any]:
         "sandbox_mode": str(SANDBOX_MODE),
         "environment": "sandbox" if SANDBOX_MODE else "main",
         "auth_configured": "true" if EXPECTED_TOKEN else "false",
-        "active_agents": len(agent_processes),
-        "agents": list(agent_processes.keys()),
+        "active_agents": len(agent_tasks),
+        "agents": list(agent_tasks.keys()),
     }
 
 
-def cleanup_all_agents() -> None:
-    for agent_id in list(agent_processes.keys()):
-        try:
-            agent_queues[agent_id]["request"].put(None)
-            process = agent_processes[agent_id]["process"]
-
-            process.join(timeout=1)
-
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=1)
-
-            if process.is_alive():
-                process.kill()
-
-        except (BrokenPipeError, EOFError, OSError):
-            pass
-        except (RuntimeError, ValueError) as e:
-            logging.getLogger(__name__).debug(f"Error during agent cleanup: {e}")
-
-
 def signal_handler(_signum: int, _frame: Any) -> None:
-    signal.signal(signal.SIGPIPE, signal.SIG_IGN) if hasattr(signal, "SIGPIPE") else None
-    cleanup_all_agents()
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    for task in agent_tasks.values():
+        task.cancel()
     sys.exit(0)
 
 
@@ -199,7 +162,4 @@ signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 
 if __name__ == "__main__":
-    try:
-        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
-    finally:
-        cleanup_all_agents()
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")

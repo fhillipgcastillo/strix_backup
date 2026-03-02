@@ -9,7 +9,11 @@ strix_root = project_root / 'strix'
 
 datas = []
 
-for jinja_file in strix_root.rglob('*.jinja'):
+for md_file in strix_root.rglob('skills/**/*.md'):
+    rel_path = md_file.relative_to(project_root)
+    datas.append((str(md_file), str(rel_path.parent)))
+
+for jinja_file in strix_root.rglob('agents/**/*.jinja'):
     rel_path = jinja_file.relative_to(project_root)
     datas.append((str(jinja_file), str(rel_path.parent)))
 
@@ -86,6 +90,14 @@ hiddenimports = [
 
     # XML parsing
     'xmltodict',
+    'defusedxml',
+    'defusedxml.ElementTree',
+
+    # Syntax highlighting
+    'pygments',
+    'pygments.lexers',
+    'pygments.styles',
+    'pygments.util',
 
     # Tiktoken (for token counting)
     'tiktoken',
@@ -94,6 +106,9 @@ hiddenimports = [
 
     # Tenacity retry
     'tenacity',
+
+    # CVSS scoring
+    'cvss',
 
     # Strix modules
     'strix',
@@ -111,7 +126,6 @@ hiddenimports = [
     'strix.llm.llm',
     'strix.llm.config',
     'strix.llm.utils',
-    'strix.llm.request_queue',
     'strix.llm.memory_compressor',
     'strix.runtime',
     'strix.runtime.runtime',
@@ -122,13 +136,14 @@ hiddenimports = [
     'strix.tools.registry',
     'strix.tools.executor',
     'strix.tools.argument_parser',
-    'strix.prompts',
+    'strix.skills',
 ]
 
 hiddenimports += collect_submodules('litellm')
 hiddenimports += collect_submodules('textual')
 hiddenimports += collect_submodules('rich')
 hiddenimports += collect_submodules('pydantic')
+hiddenimports += collect_submodules('pygments')
 
 excludes = [
     # Sandbox-only packages
